@@ -22,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-rembg_session = new_session("u2net")
+rembg_session = new_session("u2netp")
 
 ALLOWED_TYPES = [
     "image/jpeg", "image/jpg", "image/png",

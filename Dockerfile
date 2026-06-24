@@ -2,7 +2,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System dependencies
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
@@ -11,14 +10,12 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Python packages install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Build time এই model download করো — runtime এ আর লাগবে না
-RUN python -c "from rembg import new_session; new_session('u2net')"
+# মাত্র 4MB model — fast download!
+RUN python -c "from rembg import new_session; new_session('u2netp')"
 
-# App copy করো
 COPY main.py .
 
 EXPOSE 8080
