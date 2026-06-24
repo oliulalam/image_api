@@ -41,8 +41,20 @@ def image_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+def pil_to_bytes(img: Image.Image) -> bytes:
+    """PIL Image কে PNG bytes এ convert করো"""
+    buf = io.BytesIO()
+    # RGBA হলে সরাসরি PNG, নইলে RGB করে PNG
+    if img.mode in ("RGBA", "LA"):
+        img.save(buf, format="PNG")
+    else:
+        img.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def resize_if_large(img: Image.Image, max_size: int = 1024) -> Image.Image:
-    """Image বড় হলে resize করো — fast processing এর জন্য"""
+    """Image বড় হলে resize করো"""
     w, h = img.size
     if w <= max_size and h <= max_size:
         return img
@@ -59,16 +71,13 @@ def advanced_upscale(img: Image.Image, scale: int = 2) -> Image.Image:
     """Advanced multi-step upscaling pipeline"""
     original_mode = img.mode
 
-    # Step 1: LANCZOS upscale
     w, h = img.size
     upscaled = img.resize((w * scale, h * scale), Image.LANCZOS)
 
-    # Step 2: Unsharp Mask
     sharpened = upscaled.filter(
         ImageFilter.UnsharpMask(radius=2, percent=120, threshold=3)
     )
 
-    # Step 3: OpenCV edge sharpening
     img_array = np.array(sharpened.convert("RGB"))
     kernel = np.array([
         [ 0, -1,  0],
@@ -77,11 +86,8 @@ def advanced_upscale(img: Image.Image, scale: int = 2) -> Image.Image:
     ], dtype=np.float32)
     sharpened_cv = cv2.filter2D(img_array, -1, kernel)
     blended = cv2.addWeighted(img_array, 0.3, sharpened_cv, 0.7, 0)
-
-    # Step 4: Noise reduction
     denoised = cv2.fastNlMeansDenoisingColored(blended, None, 3, 3, 7, 21)
 
-    # Step 5: PIL enhancement
     result = Image.fromarray(denoised)
     result = ImageEnhance.Contrast(result).enhance(1.08)
     result = ImageEnhance.Color(result).enhance(1.05)
@@ -123,17 +129,18 @@ async def remove_background(file: UploadFile = File(...)):
     try:
         file_bytes = await file.read()
 
-        # বড় image হলে আগে resize করো
+        # Image open করো
         original_img = Image.open(io.BytesIO(file_bytes))
+
+        # বড় হলে resize করো
         resized = resize_if_large(original_img, max_size=1024)
 
-        # Resized image কে bytes এ convert করো
-        buf = io.BytesIO()
-        resized.save(buf, format="PNG")
-        resized_bytes = buf.getvalue()
+        # bytes এ convert করো
+        resized_bytes = pil_to_bytes(resized)
 
         # Background remove
         output_bytes = remove(resized_bytes, session=rembg_session)
+
         result_img = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
         result_b64 = image_to_base64(result_img, "PNG")
 
@@ -144,6 +151,8 @@ async def remove_background(file: UploadFile = File(...)):
             "format": "PNG",
             "size": {"width": result_img.width, "height": result_img.height}
         })
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
@@ -158,11 +167,9 @@ async def upscale_image(file: UploadFile = File(...), scale: int = 2):
         file_bytes = await file.read()
         original_img = Image.open(io.BytesIO(file_bytes))
 
-        # বড় image হলে আগে resize করো
         resized = resize_if_large(original_img, max_size=800)
         original_w, original_h = resized.size
 
-        # Advanced upscale
         result_img = advanced_upscale(resized, scale)
         result_b64 = image_to_base64(result_img, "PNG")
 
@@ -175,6 +182,8 @@ async def upscale_image(file: UploadFile = File(...), scale: int = 2):
             "new_size": {"width": result_img.width, "height": result_img.height},
             "scale": scale
         })
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
@@ -188,14 +197,9 @@ async def remove_bg_and_upscale(file: UploadFile = File(...), scale: int = 2):
     try:
         file_bytes = await file.read()
 
-        # বড় image হলে আগে resize করো
         original_img = Image.open(io.BytesIO(file_bytes))
         resized = resize_if_large(original_img, max_size=800)
-
-        # Resized bytes বানাও
-        buf = io.BytesIO()
-        resized.save(buf, format="PNG")
-        resized_bytes = buf.getvalue()
+        resized_bytes = pil_to_bytes(resized)
 
         # Step 1: Background remove
         bg_removed_bytes = remove(resized_bytes, session=rembg_session)
@@ -215,6 +219,8 @@ async def remove_bg_and_upscale(file: UploadFile = File(...), scale: int = 2):
             "new_size": {"width": final_img.width, "height": final_img.height},
             "scale": scale
         })
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
