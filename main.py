@@ -1,9 +1,9 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from rembg import remove, new_session
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 import cv2
 import numpy as np
 import io
@@ -12,7 +12,7 @@ import base64
 app = FastAPI(
     title="Image Processing API",
     description="Background Remove & Image Upscale API - Built with Python",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS — Flutter থেকে call করার জন্য
@@ -26,35 +26,83 @@ app.add_middleware(
 # rembg session একবার load করো (fast হবে)
 rembg_session = new_session("u2net")
 
+# সব supported image format
+ALLOWED_TYPES = [
+    "image/jpeg", "image/jpg", "image/png",
+    "image/webp", "image/heic", "image/heif",
+    "image/bmp", "image/tiff", "image/gif"
+]
+
 
 # ─────────────────────────────────────────
 # Helper Functions
 # ─────────────────────────────────────────
 
-def read_image(file_bytes: bytes) -> Image.Image:
-    """Bytes থেকে PIL Image বানাও"""
-    return Image.open(io.BytesIO(file_bytes)).convert("RGBA")
-
-
 def image_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
     """PIL Image কে base64 string এ convert করো"""
     buffer = io.BytesIO()
-    img.save(buffer, format=fmt)
+    img.save(buffer, format=fmt, optimize=True)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def upscale_image_cv2(img: Image.Image, scale: int = 2) -> Image.Image:
-    """OpenCV দিয়ে image upscale করো"""
-    # PIL → numpy array
-    img_array = np.array(img.convert("RGB"))
+def advanced_upscale(img: Image.Image, scale: int = 2) -> Image.Image:
+    """
+    Advanced multi-step upscaling:
+    Step 1: LANCZOS resize (best quality resize algorithm)
+    Step 2: Unsharp Mask (detail enhancement)
+    Step 3: Edge sharpening via OpenCV
+    Step 4: Contrast + Color enhancement
+    Step 5: Noise reduction
+    """
+    original_mode = img.mode
 
-    # Upscale using INTER_LANCZOS4 (best quality)
-    h, w = img_array.shape[:2]
-    new_h, new_w = h * scale, w * scale
-    upscaled = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    # Step 1: LANCZOS upscale (PIL এর সবচেয়ে ভালো algorithm)
+    w, h = img.size
+    upscaled = img.resize((w * scale, h * scale), Image.LANCZOS)
 
-    # numpy array → PIL Image
-    return Image.fromarray(upscaled)
+    # Step 2: Unsharp Mask — detail sharp করে
+    # radius=2, percent=120, threshold=3 — best balance
+    sharpened = upscaled.filter(
+        ImageFilter.UnsharpMask(radius=2, percent=120, threshold=3)
+    )
+
+    # Step 3: OpenCV দিয়ে edge sharpening
+    img_array = np.array(sharpened.convert("RGB"))
+
+    # Sharpening kernel
+    kernel = np.array([
+        [ 0, -1,  0],
+        [-1,  5, -1],
+        [ 0, -1,  0]
+    ], dtype=np.float32)
+    sharpened_cv = cv2.filter2D(img_array, -1, kernel)
+
+    # Blend original upscaled + sharpened (70% sharp + 30% smooth)
+    blended = cv2.addWeighted(img_array, 0.3, sharpened_cv, 0.7, 0)
+
+    # Step 4: Noise reduction — detail রেখে noise কমায়
+    denoised = cv2.fastNlMeansDenoisingColored(blended, None, 3, 3, 7, 21)
+
+    # Step 5: PIL এ ফিরে যাও
+    result = Image.fromarray(denoised)
+
+    # Step 6: Contrast সামান্য বাড়াও
+    contrast = ImageEnhance.Contrast(result)
+    result = contrast.enhance(1.08)
+
+    # Step 7: Color একটু vivid করো
+    color = ImageEnhance.Color(result)
+    result = color.enhance(1.05)
+
+    # Step 8: Sharpness একটু বাড়াও
+    sharpness = ImageEnhance.Sharpness(result)
+    result = sharpness.enhance(1.2)
+
+    # Original mode restore করো (RGBA হলে)
+    if original_mode == "RGBA":
+        result = result.convert("RGBA")
+
+    return result
 
 
 # ─────────────────────────────────────────
@@ -65,6 +113,7 @@ def upscale_image_cv2(img: Image.Image, scale: int = 2) -> Image.Image:
 async def root():
     return {
         "message": "Image Processing API চালু আছে! ✅",
+        "version": "2.0.0",
         "endpoints": {
             "background_remove": "/remove-bg",
             "upscale": "/upscale",
@@ -83,12 +132,11 @@ async def health():
 async def remove_background(file: UploadFile = File(...)):
     """
     Image এর background remove করো।
-    - Input: যেকোনো image (jpg, png, webp)
+    - Input: যেকোনো image format
     - Output: PNG with transparent background (base64)
     """
-    # Validate file type
-    if file.content_type not in ["image/jpeg", "image/png", "image/webp", "image/jpg"]:
-        raise HTTPException(status_code=400, detail="শুধু JPG, PNG, WEBP file দাও")
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported image format")
 
     try:
         file_bytes = await file.read()
@@ -96,10 +144,7 @@ async def remove_background(file: UploadFile = File(...)):
         # rembg দিয়ে background remove
         output_bytes = remove(file_bytes, session=rembg_session)
 
-        # PIL Image বানাও
         result_img = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
-
-        # Base64 encode করো
         result_b64 = image_to_base64(result_img, "PNG")
 
         return JSONResponse({
@@ -107,7 +152,7 @@ async def remove_background(file: UploadFile = File(...)):
             "message": "Background সফলভাবে remove হয়েছে!",
             "image_base64": result_b64,
             "format": "PNG",
-            "original_size": {
+            "size": {
                 "width": result_img.width,
                 "height": result_img.height
             }
@@ -123,13 +168,12 @@ async def upscale_image(
     scale: int = 2
 ):
     """
-    Image upscale করো।
-    - Input: যেকোনো image
-    - scale: 2 বা 4 (default: 2)
-    - Output: Upscaled image (base64)
+    Image upscale করো — Advanced multi-step pipeline।
+    - scale: 2 বা 4
+    - Output: High quality upscaled image (base64)
     """
-    if file.content_type not in ["image/jpeg", "image/png", "image/webp", "image/jpg"]:
-        raise HTTPException(status_code=400, detail="শুধু JPG, PNG, WEBP file দাও")
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported image format")
 
     if scale not in [2, 4]:
         raise HTTPException(status_code=400, detail="Scale শুধু 2 বা 4 হতে পারে")
@@ -137,14 +181,11 @@ async def upscale_image(
     try:
         file_bytes = await file.read()
         original_img = Image.open(io.BytesIO(file_bytes))
-
         original_w, original_h = original_img.size
 
-        # Upscale করো
-        upscaled_img = upscale_image_cv2(original_img, scale)
-
-        # Base64 encode
-        result_b64 = image_to_base64(upscaled_img, "PNG")
+        # Advanced upscale
+        result_img = advanced_upscale(original_img, scale)
+        result_b64 = image_to_base64(result_img, "PNG")
 
         return JSONResponse({
             "success": True,
@@ -152,7 +193,7 @@ async def upscale_image(
             "image_base64": result_b64,
             "format": "PNG",
             "original_size": {"width": original_w, "height": original_h},
-            "new_size": {"width": upscaled_img.width, "height": upscaled_img.height},
+            "new_size": {"width": result_img.width, "height": result_img.height},
             "scale": scale
         })
 
@@ -166,12 +207,10 @@ async def remove_bg_and_upscale(
     scale: int = 2
 ):
     """
-    Background remove করো তারপর upscale করো — একসাথে!
-    - Input: যেকোনো image
-    - Output: Background removed + upscaled image (base64)
+    Background remove + Advanced upscale — একসাথে!
     """
-    if file.content_type not in ["image/jpeg", "image/png", "image/webp", "image/jpg"]:
-        raise HTTPException(status_code=400, detail="শুধু JPG, PNG, WEBP file দাও")
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported image format")
 
     if scale not in [2, 4]:
         raise HTTPException(status_code=400, detail="Scale শুধু 2 বা 4 হতে পারে")
@@ -182,13 +221,10 @@ async def remove_bg_and_upscale(
         # Step 1: Background remove
         bg_removed_bytes = remove(file_bytes, session=rembg_session)
         bg_removed_img = Image.open(io.BytesIO(bg_removed_bytes)).convert("RGBA")
-
         original_w, original_h = bg_removed_img.size
 
-        # Step 2: Upscale
-        final_img = upscale_image_cv2(bg_removed_img, scale)
-
-        # Base64 encode
+        # Step 2: Advanced upscale
+        final_img = advanced_upscale(bg_removed_img, scale)
         result_b64 = image_to_base64(final_img, "PNG")
 
         return JSONResponse({
